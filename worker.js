@@ -38,7 +38,7 @@ export default {
 		if (url.pathname.startsWith("/status/")) {
 			return await Router.handleUserStatus(url, env);
 		}
-		return new Response(HTML_TEMPLATES.nginx, {
+		nse(HTML_TEMPLATES.nginx, {
 			headers: { "Content-Type": "text/html; charset=utf-8" },
 		});
 	},
@@ -61,7 +61,7 @@ const Router = {
 				}
 			} catch (e) {}
 			const mockStoredData = { proxy_ip: proxyIP };
-			return handleVLESS(env, mockStoredData, ctx);
+			return handleVLESS(env, mockStoredData, ctx, request);
 		} catch (e) {
 			return new Response("Internal Server Error", { status: 500 });
 		}
@@ -122,8 +122,8 @@ const Router = {
 				limit_req: user.limit_req,
 				used_req: user.used_req,
 				is_active: user.is_active,
-				online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0,
-				max_connections: user.max_connections,
+				online_count: getActiveIpCount(user.active_ips),
+				ip_limit: user.ip_limit,
 				created_at: user.created_at,
 				tls: user.tls,
 				port: user.port,
@@ -159,7 +159,7 @@ const Router = {
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
 					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
 				},
 			});
 		}
@@ -171,7 +171,7 @@ const Router = {
 				return new Response(JSON.stringify({ success: true }), {
 					headers: {
 						"Content-Type": "application/json; charset=utf-8",
-						"Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+						"Set-Cookie": "panel_session=" + storedHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
 					},
 				});
 			}
@@ -188,6 +188,78 @@ const Router = {
 				},
 			});
 		}
+		if (url.pathname === "/api/recover" && request.method === "POST") {
+			const { api_token } = await request.json();
+			if (!api_token) {
+				return new Response(JSON.stringify({ error: "Token is required" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+			try {
+				const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
+					headers: { Authorization: "Bearer " + api_token },
+				});
+				const cfData = await cfRes.json();
+				if (!cfRes.ok || !cfData.success) {
+					return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
+						status: 401,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				const host = url.hostname;
+				let isAuthorized = false;
+				if (host.endsWith(".workers.dev")) {
+					const parts = host.split(".");
+					const targetSubdomain = parts[parts.length - 3];
+					const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+						headers: { Authorization: "Bearer " + api_token },
+					});
+					const accountsData = await accountsRes.json();
+					if (accountsData.success && accountsData.result) {
+						for (const acc of accountsData.result) {
+							const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
+								headers: { Authorization: "Bearer " + api_token },
+							});
+							const subData = await subRes.json();
+							if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				} else {
+					const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
+						headers: { Authorization: "Bearer " + api_token },
+					});
+					const zonesData = await zonesRes.json();
+					if (zonesData.success && zonesData.result) {
+						for (const zone of zonesData.result) {
+							if (host === zone.name || host.endsWith("." + zone.name)) {
+								isAuthorized = true;
+								break;
+							}
+						}
+					}
+				}
+				if (!isAuthorized) {
+					return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پنل نیست (ای کــثـــکـــش)" }), {
+						status: 403,
+						headers: { "Content-Type": "application/json; charset=utf-8" },
+					});
+				}
+				await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
+				cachedPanelPassword = null;
+				return new Response(JSON.stringify({ success: true }), {
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			} catch (err) {
+				return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
+					status: 500,
+					headers: { "Content-Type": "application/json; charset=utf-8" },
+				});
+			}
+		}
 		const authorized = await DbService.verifyApiAuth(request, env);
 		if (!authorized) {
 			return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -196,10 +268,24 @@ const Router = {
 			});
 		}
 		if (url.pathname === "/api/update-panel" && request.method === "POST") {
-			if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) {
-				return new Response(JSON.stringify({ error: "توکن یا اکانت آیدی کلودفلر تنظیم نشده است. لطفا با سایت زیر اپدیت کنید https://zeus-panel.ir-netlify.workers.dev/" }), { status: 400, headers: { "Content-Type": "application/json" } });
+			const body = await request.json().catch(() => ({}));
+			let currentToken = env.CF_API_TOKEN || body.cf_token;
+			let currentAccountId = env.CF_ACCOUNT_ID;
+
+			if (!currentToken) {
+				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			}
+
 			try {
+				if (!currentAccountId) {
+					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
+						headers: { Authorization: "Bearer " + currentToken },
+					});
+					const accData = await accRes.json();
+					if (!accData.success || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
+					currentAccountId = accData.result[0].id;
+				}
+
 				const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now() + Math.random(), {
 					headers: {
 						"Cache-Control": "no-cache, no-store, must-revalidate",
@@ -209,41 +295,113 @@ const Router = {
 				});
 				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب");
 				const newCode = await githubRes.text();
+
 				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}/bindings`, {
-					headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
+				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
+					headers: { Authorization: "Bearer " + currentToken },
 				});
 				const bindingsData = await bindingsRes.json();
 				if (!bindingsData.success) throw new Error("عدم دسترسی به تنظیمات ورکر. توکن نامعتبر است.");
+
 				const newBindings = [];
 				for (const b of bindingsData.result) {
 					if (b.type === "d1") {
 						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
 					} else if (b.name === "CF_API_TOKEN") {
-						newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: env.CF_API_TOKEN });
+						newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
 					} else if (b.name === "CF_ACCOUNT_ID") {
-						newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: env.CF_ACCOUNT_ID });
+						newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
 					}
 				}
+
+				if (!newBindings.some((b) => b.name === "CF_API_TOKEN")) {
+					newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
+				}
+				if (!newBindings.some((b) => b.name === "CF_ACCOUNT_ID")) {
+					newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+				}
+
 				const metadata = {
 					main_module: "zeus.js",
 					compatibility_date: "2024-02-08",
 					bindings: newBindings,
 				};
+
 				const formData = new FormData();
 				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
 				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
-				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${scriptName}`, {
+
+				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
 					method: "PUT",
-					headers: { Authorization: "Bearer " + env.CF_API_TOKEN },
+					headers: { Authorization: "Bearer " + currentToken },
 					body: formData,
 				});
 				const deployData = await deployRes.json();
 				if (!deployData.success) throw new Error("خطا در اعمال آپدیت در کلودفلر.");
+
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			} catch (err) {
 				const errorMsg = err.message + " | در صورت عدم موفقیت، از طریق لینک زیر آپدیت کنید: https://zeus-panel.ir-netlify.workers.dev/";
 				return new Response(JSON.stringify({ error: errorMsg }), { status: 500, headers: { "Content-Type": "application/json" } });
+			}
+		}
+		if (url.pathname === "/api/restart-core" && request.method === "POST") {
+			let currentToken = env.CF_API_TOKEN;
+			let currentAccountId = env.CF_ACCOUNT_ID;
+
+			if (!currentToken || !currentAccountId) {
+				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
+			}
+
+			try {
+				const githubRes = await fetch("https://raw.githubusercontent.com/IR-NETLIFY/zeus/refs/heads/main/zeus.js?t=" + Date.now(), {
+					headers: {
+						"Cache-Control": "no-cache, no-store, must-revalidate",
+						Pragma: "no-cache",
+						Expires: "0",
+					},
+				});
+				if (!githubRes.ok) throw new Error("خطا در دریافت سورس از گیت‌هاب");
+				const newCode = await githubRes.text();
+
+				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
+				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
+					headers: { Authorization: "Bearer " + currentToken },
+				});
+				const bindingsData = await bindingsRes.json();
+				if (!bindingsData.success) throw new Error("عدم دسترسی به تنظیمات ورکر");
+
+				const newBindings = [];
+				for (const b of bindingsData.result) {
+					if (b.type === "d1") {
+						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
+					}
+				}
+
+				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
+				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
+
+				const metadata = {
+					main_module: "zeus.js",
+					compatibility_date: "2024-02-08",
+					bindings: newBindings,
+				};
+
+				const formData = new FormData();
+				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
+
+				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
+					method: "PUT",
+					headers: { Authorization: "Bearer " + currentToken },
+					body: formData,
+				});
+				const deployData = await deployRes.json();
+				if (!deployData.success) throw new Error("خطا در اعمال ری‌استارت در کلودفلر");
+
+				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
+			} catch (err) {
+				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
@@ -273,7 +431,7 @@ const Router = {
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
 					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax",
+					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
 				},
 			});
 		}
@@ -292,24 +450,18 @@ const Router = {
 		}
 		if (url.pathname === "/api/proxy-ip") {
 			if (request.method === "POST") {
-				const { proxy_ip, iata, frag_len, frag_int } = await request.json();
+				const { proxy_ip, iata } = await request.json();
 				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
 				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
-				if (frag_len !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_len', ?)").bind(frag_len).run();
-				if (frag_int !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('frag_int', ?)").bind(frag_int).run();
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			}
 			if (request.method === "GET") {
 				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
 				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
-				const rowLen = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_len'").first();
-				const rowInt = await env.DB.prepare("SELECT value FROM settings WHERE key = 'frag_int'").first();
 				return new Response(
 					JSON.stringify({
 						proxy_ip: rowIp ? rowIp.value : "proxyip.cmliussss.net",
 						iata: rowIata ? rowIata.value : "",
-						frag_len: rowLen ? rowLen.value : "20-30",
-						frag_int: rowInt ? rowInt.value : "1-2",
 					}),
 					{ headers: { "Content-Type": "application/json" } },
 				);
@@ -337,7 +489,7 @@ const Router = {
 						}
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
-						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = body;
+						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int } = body;
 						if (new_username && new_username !== username) {
 							const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ?").bind(new_username).first();
 							if (existing) {
@@ -360,8 +512,8 @@ const Router = {
 								GLOBAL_LAST_ACTIVE_WRITE.delete(username);
 							}
 						}
-						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ? WHERE username = ?")
-							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null, username)
+						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ? WHERE username = ?")
+							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len || "20-30", frag_int || "1-2", username)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					}
@@ -379,8 +531,8 @@ const Router = {
 					const now = Date.now();
 					const enrichedUsers = (results || []).map((user) => ({
 						...user,
-						is_online: user.last_active && now - user.last_active < 65000 ? 1 : 0,
-						online_count: ACTIVE_CONNECTIONS_COUNT.get(user.username) || 0,
+						is_online: user.last_active && now - user.last_active < 25000 ? 1 : 0,
+						online_count: getActiveIpCount(user.active_ips),
 					}));
 					let cfReqs = { today: 0, total: 0 };
 					try {
@@ -422,14 +574,21 @@ const Router = {
 					);
 				}
 				if (request.method === "POST") {
-					const { username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, max_connections } = await request.json();
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int } = await request.json();
 					if (!username) {
 						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
-					const uuid = crypto.randomUUID();
+					const finalUuid = uuid || crypto.randomUUID();
+					const parsedUsedGb = parseFloat(used_gb);
+					const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
+					const parsedUsedReq = parseInt(used_req);
+					const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
+					const finalCreatedAt = created_at || new Date().toISOString();
+					const parsedIsActive = parseInt(is_active);
+					const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
 					try {
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, uuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob("dmxlc3M="), tls, port, fingerprint || "chrome", max_connections ? parseInt(max_connections) : null)
+						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob("dmxlc3M="), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len || "20-30", frag_int || "1-2")
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} catch (err) {
@@ -488,7 +647,28 @@ const DbService = {
 			await db.prepare("ALTER TABLE users ADD COLUMN used_req INTEGER DEFAULT 0").run();
 		} catch (e) {}
 		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN ip_limit INTEGER DEFAULT NULL").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN active_ips TEXT DEFAULT NULL").run();
+		} catch (e) {}
+		try {
+			await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
+		} catch (e) {}
+		try {
 			await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN block_porn INTEGER DEFAULT 0").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN block_ads INTEGER DEFAULT 0").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN frag_len TEXT DEFAULT '20-30'").run();
+		} catch (e) {}
+		try {
+			await db.prepare("ALTER TABLE users ADD COLUMN frag_int TEXT DEFAULT '1-2'").run();
 		} catch (e) {}
 		schemaEnsured = true;
 	},
@@ -522,6 +702,23 @@ const DbService = {
 		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
 	},
 };
+function getActiveIpCount(activeIpsJson) {
+	if (!activeIpsJson) return 0;
+	try {
+		const activeIps = JSON.parse(activeIpsJson);
+		const now = Date.now();
+		let count = 0;
+		for (const [ip, data] of Object.entries(activeIps)) {
+			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+			if (now - lastSeen <= 30000) {
+				count++;
+			}
+		}
+		return count;
+	} catch (e) {
+		return 0;
+	}
+}
 const SubscriptionService = {
 	async generateText(user, host) {
 		let ips = [host];
@@ -561,8 +758,9 @@ const SubscriptionService = {
 			ports.forEach((portStr) => {
 				const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
 				const tlsVal = isTlsPort ? "tls" : "none";
+				const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
 				const remark = user.username + " | " + ip + " | " + portStr;
-				links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + ip + ":" + portStr + "?path=%2Fqaim_panel&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + "#" + encodeURIComponent(remark));
+				links.push(atob("dmxlc3M6Ly8=") + user.uuid + "@" + ip + ":" + portStr + "?path=%qaim_panel&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + userFrag + "#" + encodeURIComponent(remark));
 			});
 		});
 		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
@@ -593,7 +791,7 @@ async function flushExpiredTraffic(env) {
 		if (GLOBAL_WRITE_LOCK.get(uname)) continue;
 		const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
 		const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-		if (activeCount <= 0 || now - lastActive > 65000) {
+		if (activeCount <= 0 || now - lastActive > 25000) {
 			GLOBAL_WRITE_LOCK.set(uname, true);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 			try {
@@ -609,7 +807,8 @@ async function flushExpiredTraffic(env) {
 		}
 	}
 }
-async function handleVLESS(env, storedData = null, ctx = null) {
+async function handleVLESS(env, storedData = null, ctx = null, request = null) {
+	const clientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
 	const socketPair = new WebSocketPair();
 	const [clientSock, serverSock] = Object.values(socketPair);
 	serverSock.accept();
@@ -617,6 +816,9 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 	let username = null;
 	let tickCount = 0;
 	let validUUID = null;
+	let userIpLimit = null;
+	let targetDns = "8.8.4.4";
+	let targetDoh = "https://cloudflare-dns.com/dns-query";
 	function addBytes(bytes) {
 		if (bytes <= 0) return;
 		if (!username) {
@@ -665,6 +867,35 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 		isOfflineSet = true;
 		const uname = username;
 		if (!uname) return;
+		if (clientIP && clientIP !== "unknown" && validUUID) {
+			const removeIpTask = async () => {
+				try {
+					const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+					if (user) {
+						console.log(`[setOffline Task] DB active_ips for ${uname}: ${user.active_ips}`);
+						let activeIps = JSON.parse(user.active_ips || "{}");
+						if (activeIps[clientIP]) {
+							if (typeof activeIps[clientIP] === "object") {
+								activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
+								if (activeIps[clientIP].count <= 0) {
+									delete activeIps[clientIP];
+								}
+							} else {
+								delete activeIps[clientIP];
+							}
+							await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), validUUID).run();
+							console.log(`[setOffline Task] Updated active_ips in DB to: ${JSON.stringify(activeIps)}`);
+						} else {
+							console.log(`[setOffline Task] IP ${clientIP} not found in user's active_ips`);
+						}
+					}
+				} catch (e) {
+					console.error(`[setOffline Task] Error: ${e.message}`);
+				}
+			};
+			if (ctx) ctx.waitUntil(removeIpTask());
+			else removeIpTask();
+		}
 		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 1;
 		activeCount = activeCount - 1;
 		if (activeCount <= 0) {
@@ -709,8 +940,13 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 				tickCount++;
 				if (tickCount >= 1) {
 					tickCount = 0;
-					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at FROM users WHERE uuid = ?").bind(validUUID).first();
+					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
+					if (user) {
+						userIpLimit = user.ip_limit;
+					}
 					let isExpired = false;
+					let isIpLimitExpired = false;
+					let updatedActiveIps = null;
 					if (!user || user.is_active === 0) {
 						isExpired = true;
 					} else {
@@ -727,6 +963,39 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 								isExpired = true;
 							}
 						}
+						if (!isExpired && clientIP && clientIP !== "unknown") {
+							let activeIps = {};
+							try {
+								activeIps = JSON.parse(user.active_ips || "{}");
+							} catch (e) {}
+							const nowTime = Date.now();
+							let hasChanges = false;
+							for (const [ip, data] of Object.entries(activeIps)) {
+								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+								if (nowTime - lastSeen > 30000) {
+									delete activeIps[ip];
+									hasChanges = true;
+								}
+							}
+							if (!activeIps[clientIP]) {
+								isIpLimitExpired = true;
+								console.log(`[Heartbeat] IP ${clientIP} expired from active_ips due to inactivity.`);
+							} else {
+								const sortedIps = Object.keys(activeIps).sort((a, b) => {
+									const tA = activeIps[a] && typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
+									const tB = activeIps[b] && typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
+									return tB - tA;
+								});
+								const clientIpIndex = sortedIps.indexOf(clientIP);
+								if (user.ip_limit && user.ip_limit > 0 && clientIpIndex >= user.ip_limit) {
+									isIpLimitExpired = true;
+									console.log(`[Heartbeat] IP Limit Exceeded. Client IP index ${clientIpIndex} >= limit ${user.ip_limit}.`);
+								}
+							}
+							if (hasChanges || isIpLimitExpired) {
+								updatedActiveIps = JSON.stringify(activeIps);
+							}
+						}
 					}
 					if (isExpired) {
 						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
@@ -734,11 +1003,21 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 						closeSocketQuietly(serverSock);
 						return;
 					}
+					if (isIpLimitExpired) {
+						console.log(`[Heartbeat] Terminating socket for user ${username}.`);
+						clearInterval(heartbeat);
+						closeSocketQuietly(serverSock);
+						return;
+					}
 					const now = Date.now();
 					const lastRecorded = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
-					if (now - lastRecorded > 15000) {
+					if (now - lastRecorded > 15000 || updatedActiveIps !== null) {
 						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+						if (updatedActiveIps !== null) {
+							await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(now, updatedActiveIps, username).run();
+						} else {
+							await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
+						}
 					}
 				}
 			} catch (e) {}
@@ -804,7 +1083,7 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 		const bytes = chunk.byteLength || 0;
 		await addBytes(bytes);
 		if (isDnsQuery) {
-			await forwardVlessUDP(chunk, serverSock, null, addBytes);
+			await forwardVlessUDP(chunk, serverSock, null, addBytes, targetDns);
 			return;
 		}
 		if (await writeToRemote(chunk)) return;
@@ -848,16 +1127,65 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 					return;
 				}
 			}
+			userIpLimit = user.ip_limit;
+			if (user.block_porn === 1 && user.block_ads === 1) {
+				targetDns = "94.140.14.15";
+				targetDoh = "https://family.adguard-dns.com/dns-query";
+			} else if (user.block_porn === 1) {
+				targetDns = "1.1.1.3";
+				targetDoh = "https://family.cloudflare-dns.com/dns-query";
+			} else if (user.block_ads === 1) {
+				targetDns = "94.140.14.14";
+				targetDoh = "https://dns.adguard-dns.com/dns-query";
+			}
+			if (clientIP && clientIP !== "unknown") {
+				console.log(`[VLESS Handshake] User: ${user.username}, clientIP: ${clientIP}, active_ips in DB: ${user.active_ips}`);
+				let activeIps = {};
+				try {
+					activeIps = JSON.parse(user.active_ips || "{}");
+				} catch (e) {}
+				const now = Date.now();
+				for (const [ip, data] of Object.entries(activeIps)) {
+					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
+					if (now - lastSeen > 30000) {
+						delete activeIps[ip];
+					}
+				}
+				if (!activeIps[clientIP]) {
+					const sortedIps = Object.keys(activeIps).sort((a, b) => {
+						const tA = activeIps[a] && typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
+						const tB = activeIps[b] && typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
+						return tB - tA;
+					});
+					console.log(`[VLESS Handshake] Non-expired active IPs: ${JSON.stringify(activeIps)}, count: ${sortedIps.length}, limit: ${user.ip_limit}`);
+					if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) {
+						console.log(`[VLESS Handshake] BLOCKED user ${user.username} because sortedIps.length (${sortedIps.length}) >= limit (${user.ip_limit})`);
+						serverSock.close();
+						return;
+					}
+					activeIps[clientIP] = { timestamp: now, count: 1 };
+				} else {
+					if (typeof activeIps[clientIP] === "object") {
+						activeIps[clientIP].timestamp = now;
+						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
+					} else {
+						activeIps[clientIP] = { timestamp: now, count: 1 };
+					}
+					console.log(`[VLESS Handshake] Reconnected from same IP: ${clientIP}, count: ${activeIps[clientIP].count}`);
+				}
+				try {
+					await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
+					console.log(`[VLESS Handshake] Successfully updated active_ips to: ${JSON.stringify(activeIps)}`);
+				} catch (e) {
+					console.error(`[VLESS Handshake] DB Update Error: ${e.message}`);
+				}
+			}
 			validUUID = reqUUID;
 			username = user.username;
 			isHeaderParsed = true;
 			let currentReqs = USER_REQ_CACHE.get(username) || 0;
 			USER_REQ_CACHE.set(username, currentReqs + 1);
 			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-			if (user.max_connections && user.max_connections > 0 && activeCount >= user.max_connections) {
-				serverSock.close();
-				return;
-			}
 			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
 			if (activeCount === 0) {
 				const setOnlineTask = async () => {
@@ -893,7 +1221,7 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 				if (cmd === 2) {
 					if (port === 53) {
 						isDnsQuery = true;
-						await forwardVlessUDP(rawData, serverSock, respHeader, addBytes);
+						await forwardVlessUDP(rawData, serverSock, respHeader, addBytes, targetDns);
 					} else {
 						serverSock.close();
 					}
@@ -907,10 +1235,10 @@ async function handleVLESS(env, storedData = null, ctx = null) {
 					const task = (async () => {
 						let s = null;
 						try {
-							s = await connectDirect(addr, port, dataPayload);
+							s = await connectDirect(addr, port, dataPayload, targetDoh);
 						} catch (err) {
 							if (useFallback && proxyIP) {
-								s = await connectDirect(proxyIP, port, dataPayload);
+								s = await connectDirect(proxyIP, port, dataPayload, targetDoh);
 							} else {
 								throw err;
 							}
@@ -1062,8 +1390,8 @@ function closeSocketQuietly(socket) {
 		}
 	} catch (e) {}
 }
-async function dohQuery(domain, recordType) {
-	const cacheKey = `${domain}:${recordType}`;
+async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
+	const cacheKey = `${domain}:${recordType}:${targetDoh}`;
 	if (DNS_CACHE.has(cacheKey)) {
 		const cached = DNS_CACHE.get(cacheKey);
 		if (Date.now() < cached.expires) return cached.data;
@@ -1091,7 +1419,7 @@ async function dohQuery(domain, recordType) {
 		query.set(qname, 12);
 		qview.setUint16(12 + qname.length, qtype);
 		qview.setUint16(12 + qname.length + 2, 1);
-		const response = await fetch(DOH_RESOLVER, {
+		const response = await fetch(targetDoh, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/dns-message",
@@ -1505,9 +1833,9 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	}
 	if (!hasData && retryFunc) await retryFunc();
 }
-async function buildRaceCandidates(address, port) {
+async function buildRaceCandidates(address, port, targetDoh) {
 	if (!PRELOAD_RACE_DIAL || isIPHostname(address)) return null;
-	const [aRecords, aaaaRecords] = await Promise.all([dohQuery(address, "A"), dohQuery(address, "AAAA")]);
+	const [aRecords, aaaaRecords] = await Promise.all([dohQuery(address, "A", targetDoh), dohQuery(address, "AAAA", targetDoh)]);
 	const ipv4List = [
 		...new Set(
 			aRecords.flatMap((r) => {
@@ -1527,8 +1855,8 @@ async function buildRaceCandidates(address, port) {
 	if (ipList.length === 0) return null;
 	return ipList.map((hostname, attempt) => ({ hostname, port, attempt, resolvedFrom: address }));
 }
-async function connectDirect(address, port, initialData = null) {
-	const raceCandidates = await buildRaceCandidates(address, port);
+async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
+	const raceCandidates = await buildRaceCandidates(address, port, targetDoh);
 	const candidates = raceCandidates || Array.from({ length: TCP_CONCURRENCY }, () => ({ hostname: address, port }));
 	const openConnection = async (host, prt) => {
 		const socket = connect({ hostname: host, port: prt });
@@ -1570,10 +1898,10 @@ async function connectDirect(address, port, initialData = null) {
 		}
 	}
 }
-async function forwardVlessUDP(udpChunk, webSocket, respHeader, onBytes) {
+async function forwardVlessUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
 	const requestData = convertToUint8Array(udpChunk);
 	try {
-		const tcpSocket = connect({ hostname: "8.8.4.4", port: 53 });
+		const tcpSocket = connect({ hostname: dnsServer, port: 53 });
 		let vlessHeader = respHeader;
 		const writer = tcpSocket.writable.getWriter();
 		await writer.write(requestData);
@@ -1736,6 +2064,7 @@ const HTML_TEMPLATES = {
     </script>
 </body>
 </html>`,
+
 	login: `<!DOCTYPE html>
 <html lang="fa" dir="rtl" class="dark">
 <head>
@@ -1758,15 +2087,40 @@ const HTML_TEMPLATES = {
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
     <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl p-6">
-        <h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">ورود به پنل مدیریت</h2>
-        <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">برای دسترسی به پنل مدیریت، رمز عبور خود را وارد کنید.</p>
-        <form onsubmit="handleLogin(event)" class="space-y-4">
-            <div>
-                <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+        <div id="login-section">
+            <h2 class="text-xl font-bold mb-6 text-center text-blue-600 dark:text-blue-400">ورود به پنل مدیریت</h2>
+            <form onsubmit="handleLogin(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
+                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
+                </div>
+                <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ورود</button>
+            </form>
+            <div class="mt-4 text-center">
+                <button onclick="toggleRecovery(true)" class="text-xs text-blue-500 hover:text-blue-600 transition font-medium">بازیابی رمز پنل</button>
             </div>
-            <button type="submit" id="submit-btn" class="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-lg text-sm transition font-bold">ورود</button>
-        </form>
+        </div>
+        <div id="recovery-section" class="hidden">
+            <h2 class="text-xl font-bold mb-4 text-center text-orange-600 dark:text-orange-400">بازیابی رمز پنل</h2>
+            
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-xl text-xs leading-relaxed text-orange-800 dark:text-orange-300">
+                برای احراز هویت و اثبات مالکیت پنل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
+                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-orange-500 hover:bg-orange-600 text-white rounded-lg font-bold transition shadow-md shadow-orange-500/20">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                    دریافت توکن
+                </a>
+            </div>
+
+            <form onsubmit="handleRecovery(event)" class="space-y-4">
+                <div>
+                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs text-center font-mono" required>
+                </div>
+                <div class="flex gap-2 pt-2">
+                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-gray-200 dark:bg-zinc-800 hover:bg-gray-300 dark:hover:bg-zinc-700 text-gray-700 dark:text-zinc-300 font-medium rounded-lg text-sm transition">انصراف</button>
+                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-orange-600 hover:bg-orange-700 text-white font-medium rounded-lg text-sm transition font-bold">بازیابی رمز پنل</button>
+                </div>
+            </form>
+        </div>
     </div>
     <script>
         async function handleLogin(event) {
@@ -1774,7 +2128,6 @@ const HTML_TEMPLATES = {
             const password = document.getElementById('password').value;
             const btn = document.getElementById('submit-btn');
             btn.disabled = true;
-            btn.innerText = 'در حال بررسی...';
             try {
                 const res = await fetch('/api/login', {
                     method: 'POST',
@@ -1785,18 +2138,46 @@ const HTML_TEMPLATES = {
                 if (res.ok && data.success) {
                     window.location.reload();
                 } else {
-                    alert('❌ رمز عبور اشتباه است!');
+                    alert('رمز عبور اشتباه است');
                 }
             } catch (err) {
                 alert('خطا در ارتباط با سرور');
             } finally {
                 btn.disabled = false;
-                btn.innerText = 'ورود';
+            }
+        }
+        function toggleRecovery(show) {
+            document.getElementById('login-section').classList.toggle('hidden', show);
+            document.getElementById('recovery-section').classList.toggle('hidden', !show);
+        }
+        async function handleRecovery(event) {
+            event.preventDefault();
+            const apiToken = document.getElementById('api-token').value;
+            const btn = document.getElementById('recover-btn');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/recover', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_token: apiToken })
+                });
+                const data = await res.json();
+                if (res.ok && data.success) {
+                    alert('رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
+                    window.location.reload();
+                } else {
+                    alert(data.error || 'خطا در تایید اطلاعات');
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور');
+            } finally {
+                btn.disabled = false;
             }
         }
     </script>
 </body>
 </html>`,
+
 	panel: `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -1827,9 +2208,12 @@ const HTML_TEMPLATES = {
     </script>
     <style>
         body { font-family: 'Vazirmatn', sans-serif; }
+		.dark input[type="checkbox"] {
+            filter: invert(1) hue-rotate(180deg);
+        }
         ::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
+            width: 6px;
+            height: 6px;
         }
         ::-webkit-scrollbar-track {
             background: #f3f4f6; 
@@ -1866,21 +2250,16 @@ const HTML_TEMPLATES = {
         <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
             <div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
                 <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
-                    ZEUS Panel 
-                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.4.10</span>
+                    Qaim Panel 
+                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.5.10</span>
                 </h1>
                 <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
-                    <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
+                    <a href="https://github.com/QAIM-ABBAS/zeusPanel" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
                         </svg>
                     </a>
-                    <a href="https://www.youtube.com/@MacanDev" target="_blank" rel="noopener noreferrer" class="text-red-500 hover:text-red-600 dark:hover:text-red-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="YouTube">
-                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .5 6.186C0 8.07 0 12 0 12s0 3.93.5 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.378.505 9.378.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-                        </svg>
-                    </a>
-                    <a href="https://t.me/EzAccess1" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
+                    <a href="https://t.me/waitforme313" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
                         <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
                             <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
                         </svg>
@@ -1888,24 +2267,84 @@ const HTML_TEMPLATES = {
                 </div>
             </div>
             <div class="flex items-center justify-center gap-3 w-full md:w-auto mt-2 md:mt-0">
-                <button id="theme-toggle" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition">
-                    <svg id="sun-icon" class="w-5 h-5 hidden dark:block text-yellow-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-                    <svg id="moon-icon" class="w-5 h-5 block dark:hidden text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+			
+				<button onclick="restartCore()" 
+                        class="p-2 rounded-lg 
+                               bg-blue-50 dark:bg-blue-950/30 
+                               border border-blue-200 dark:border-blue-900 
+                               hover:bg-blue-100 dark:hover:bg-blue-900/50 
+                               transition-all duration-200 
+                               text-blue-600 dark:text-blue-400 shadow-sm" 
+                        title="ری‌استارت هسته ورکر">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
                 </button>
-                <button id="update-toggle" onclick="checkForUpdates(true)" class="p-2 rounded-lg bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/50 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition text-emerald-600 dark:text-emerald-400 relative shadow-sm" title="Update">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"></path></svg>
+				
+                <button id="theme-toggle" 
+                        class="p-2 rounded-lg 
+                               bg-amber-50 dark:bg-amber-950/30 
+                               border border-amber-200 dark:border-amber-900 
+                               hover:bg-amber-100 dark:hover:bg-amber-900/50 
+                               transition-all duration-200 
+                               text-amber-500 dark:text-amber-400 shadow-sm"
+                        title="تغییر تم">
+                    <svg id="sun-icon" class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path>
+                    </svg>
+                    <svg id="moon-icon" class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
+                    </svg>
+                </button>
+                
+                <button id="update-toggle" onclick="checkForUpdates(true)" 
+                        class="p-2 rounded-lg 
+                               bg-emerald-50 dark:bg-emerald-950/30 
+                               border border-emerald-200 dark:border-emerald-900 
+                               hover:bg-emerald-100 dark:hover:bg-emerald-900/50 
+                               transition-all duration-200 
+                               text-emerald-600 dark:text-emerald-400 
+                               relative shadow-sm" 
+                        title="آپدیت">
+                    
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"></path>
+                    </svg>
                     <span id="update-badge" class="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 border-2 border-emerald-50 dark:border-emerald-900 rounded-full hidden animate-pulse"></span>
-                </button>				
-                <button onclick="toggleSettingsModal(true)" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-gray-200 dark:hover:bg-zinc-800 transition text-gray-600 dark:text-gray-300 shadow-sm" title="Settings">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                 </button>
-                <button onclick="logoutAdmin()" class="p-2 rounded-lg bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border hover:bg-red-50 dark:hover:bg-red-950/20 transition text-red-600 dark:text-red-400 shadow-sm" title="Logout">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                
+                <button onclick="toggleSettingsModal(true)" 
+                        class="p-2 rounded-lg 
+                               bg-gray-50 dark:bg-zinc-800/50 
+                               border border-gray-200 dark:border-zinc-700 
+                               hover:bg-gray-100 dark:hover:bg-zinc-700/80 
+                               transition-all duration-200 
+                               text-gray-600 dark:text-zinc-400 shadow-sm" 
+                        title="تنظیمات">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                    </svg>
+                </button>
+				
+                <button 
+                    onclick="logoutAdmin()" 
+                    class="p-2 rounded-lg 
+                           bg-red-50 dark:bg-red-950/30 
+                           border border-red-200 dark:border-red-900 
+                           hover:bg-red-100 dark:hover:bg-red-900/50 
+                           transition-all duration-200 
+                           text-red-600 dark:text-red-400 
+                           shadow-sm hover:shadow-md"
+                    title="خروج">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+                    </svg>
                 </button>
             </div>
         </div>
     </header>
-    <main class="max-w-6xl mx-auto px-4 py-8">
+    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32">
 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-5 mb-8">
     <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm flex flex-col justify-between hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group">
         <div class="absolute -right-4 -bottom-4 w-24 h-24 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
@@ -1996,16 +2435,13 @@ const HTML_TEMPLATES = {
             <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
         </div>
         <div class="mb-6 flex flex-col md:flex-row gap-4 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl p-4 shadow-sm">
-            <!-- Search Box -->
             <div class="relative w-full md:w-80">
                 <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-9 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm">
                 <div class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
                 </div>
             </div>
-            <!-- Filters & Sorting -->
             <div class="flex flex-wrap items-center gap-3 w-full md:w-auto">
-                <!-- Status Filter -->
                 <select id="filter-status" onchange="filterAndRenderUsers()" class="px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
                     <option value="all">🔍 همه وضعیت‌ها</option>
                     <option value="active">✅ فعال</option>
@@ -2014,7 +2450,6 @@ const HTML_TEMPLATES = {
                     <option value="offline">💤 آفلاین</option>
                     <option value="expired">⏳ منقضی شده / تمام شده</option>
                 </select>
-                <!-- Sorting -->
                 <select id="sort-users" onchange="filterAndRenderUsers()" class="px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
                     <option value="newest">📅 جدیدترین</option>
                     <option value="name">🔤 نام کاربری (الفبا)</option>
@@ -2034,6 +2469,7 @@ const HTML_TEMPLATES = {
             <table class="w-full text-right border-collapse">
                 <thead>
                     <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400 text-center">
+                        <th class="p-2 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"></th>
                         <th class="p-4">نام کاربر و عملیات</th>
                         <th class="p-2 border-r border-gray-200 dark:border-zinc-800">لینک ساب</th>
                         <th class="p-2 border-r border-gray-200 dark:border-zinc-800">پروتکل</th>
@@ -2077,6 +2513,20 @@ const HTML_TEMPLATES = {
         </p>
         <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-orange-600 hover:bg-orange-700 text-white font-black rounded-xl text-sm transition duration-300 shadow-lg shadow-orange-500/25">
             متوجه شدم
+        </button>
+    </div>
+</div>
+<div id="free-panel-warning-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-rose-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-100 dark:bg-rose-900/30 text-rose-500 mb-4 shadow-inner">
+            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+        </div>
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">پیام همگانی</h3>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+            این پنل کاملاً <span class="text-rose-500 font-bold">رایگان</span> است. هرگونه فروش پنل یا کانفیگ‌های آن مصداق بی ناموسی و بی شرفی است. لطفاً از این ابزار فقط به صورت شخصی و رایگان استفاده کنید.
+        </p>
+        <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-rose-600 hover:bg-rose-700 text-white font-black rounded-xl text-sm transition duration-300 shadow-lg shadow-rose-500/25">
+            تأیید و موافقت
         </button>
     </div>
 </div>
@@ -2131,16 +2581,26 @@ const HTML_TEMPLATES = {
                             </div>
                         </div>
                         <div>
-                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">کاربر همزمان</label>
+                            <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">محدودیت کاربر</label>
                             <div class="relative">
                                 <span class="absolute inset-y-0 right-0 flex items-center pr-3.5 pointer-events-none text-gray-400">
                                     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
                                 </span>
-                                <input type="number" id="input-max-connections" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                                <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-10 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
                             </div>
                         </div>
                     </div>
                 </div>
+<div class="grid grid-cols-2 gap-4 mt-4">
+    <div>
+        <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">Fragment Length</label>
+        <input type="text" id="input-frag-len" placeholder="20-30" value="20-30" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-mono text-center text-gray-800 dark:text-zinc-100 transition">
+    </div>
+    <div>
+        <label class="block text-[10px] sm:text-xs font-bold text-gray-500 dark:text-zinc-400 mb-2 uppercase tracking-wider">Fragment Interval</label>
+        <input type="text" id="input-frag-int" placeholder="1-2" value="1-2" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-mono text-center text-gray-800 dark:text-zinc-100 transition">
+    </div>
+</div>
                 <div class="pt-2 border-t border-gray-100 dark:border-zinc-900">
                     <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-3 uppercase tracking-wider">پورت‌های اتصال (انتخاب چندگانه)</label>
                     <div class="space-y-4">
@@ -2150,7 +2610,6 @@ const HTML_TEMPLATES = {
                                 <span class="text-xs font-bold text-blue-600 dark:text-blue-400">🔒 پورت‌های امن (TLS)</span>
                             </div>
                             <div class="grid grid-cols-3 sm:grid-cols-4 gap-2" id="tls-ports-list">
-                                <!-- Filled dynamically -->
                             </div>
                         </div>
                         <div class="p-4 bg-gray-50/50 dark:bg-zinc-900/20 border border-gray-200/60 dark:border-zinc-800 rounded-2xl shadow-sm">
@@ -2159,7 +2618,6 @@ const HTML_TEMPLATES = {
                                 <span class="text-xs font-bold text-amber-600 dark:text-amber-400">🔓 پورت‌های معمولی (Non-TLS)</span>
                             </div>
                             <div class="grid grid-cols-3 sm:grid-cols-4 gap-2" id="nontls-ports-list">
-                                <!-- Filled dynamically -->
                             </div>
                         </div>
                     </div>
@@ -2168,7 +2626,12 @@ const HTML_TEMPLATES = {
 					<div>
     					<div class="flex items-center justify-between mb-2">
         					<label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
-        					<button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">مخزن آیپی تمیز</button>
+        					<button 
+								type="button" 
+  								onclick="openIpSelectorModal()" 
+  								class="px-2.5 py-1 bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/70 border border-amber-400 dark:border-amber-600 rounded-lg text-xs font-bold transition-all">
+  								مخزن آیپی تمیز
+							</button>
     					</div>
     					<textarea id="input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
 					</div>
@@ -2192,6 +2655,18 @@ const HTML_TEMPLATES = {
                             </div>
                         </div>
                     </div>
+						<div class="flex flex-row flex-wrap items-center justify-center gap-6 pt-4 border-t border-gray-100 dark:border-zinc-900 mt-4">
+    						<label class="relative inline-flex items-center cursor-pointer select-none">
+        						<input type="checkbox" id="input-block-porn" class="sr-only peer">
+        						<div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-emerald-500"></div>
+        						<span class="mr-3 text-sm font-bold text-gray-700 dark:text-zinc-300">&#x645;&#x633;&#x62F;&#x648;&#x62F; &#x633;&#x627;&#x632;&#x6CC; &#x67E;&#x648;&#x631;&#x646;&#x648;&#x6AF;&#x631;&#x627;&#x641;&#x6CC;</span>
+    						</label>
+    						<label class="relative inline-flex items-center cursor-pointer select-none">
+        						<input type="checkbox" id="input-block-ads" class="sr-only peer">
+        						<div class="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-emerald-500"></div>
+        						<span class="mr-3 text-sm font-bold text-gray-700 dark:text-zinc-300">&#x645;&#x633;&#x62F;&#x648;&#x62F; &#x633;&#x627;&#x632;&#x6CC; &#x62A;&#x628;&#x644;&#x6CC;&#x63A;&#x627;&#x62A;</span>
+    						</label>
+						</div>
                 </div>
                 <div class="pt-4 flex gap-3">
                     <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700/80 text-gray-700 dark:text-zinc-300 font-bold rounded-xl text-sm transition duration-200">انصراف</button>
@@ -2221,7 +2696,7 @@ const HTML_TEMPLATES = {
                 </div>
                 <div>
                     <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">تعداد</label>
-                    <input type="number" id="ip-count-input" min="1" value="10" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
+                    <input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
                 </div>
             </div>
             <div class="pt-4 flex gap-3">
@@ -2232,14 +2707,14 @@ const HTML_TEMPLATES = {
     </div>
 </div>
     <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
+        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-2xl shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
             <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
                 <h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پنل</h3>
                 <button onclick="toggleSettingsModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-zinc-200">
                     <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                 </button>
             </div>
-            <div class="p-6 space-y-4">
+            <div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
                 <div>
                     <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">موقعیت جغرافیایی پروکسی (Cloudflare)</label>
                     <div class="relative">
@@ -2251,17 +2726,7 @@ const HTML_TEMPLATES = {
                         </div>
                     </div>
                 </div>
-                <div class="grid grid-cols-2 gap-4 pt-2 border-t border-gray-100 dark:border-zinc-800">
-                    <div>
-                        <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">Fragment Length</label>
-                        <input type="text" id="frag-length" placeholder="20-30" class="w-full px-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" dir="ltr">
-                    </div>
-                    <div>
-                        <label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">Fragment Interval</label>
-                        <input type="text" id="frag-interval" placeholder="1-2" class="w-full px-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" dir="ltr">
-                    </div>
-                </div>
-                <!-- Change Password Section -->
+               
                 <div class="pt-4 border-t border-gray-100 dark:border-zinc-800">
                     <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
                     <div class="space-y-3">
@@ -2275,6 +2740,18 @@ const HTML_TEMPLATES = {
                         </div>
                         <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold rounded-lg text-xs transition-all shadow-sm">تغییر رمز عبور</button>
                     </div>
+                </div>
+                <div class="pt-4 border-t border-gray-100 dark:border-zinc-800">
+                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">💾 پشتیبان‌گیری و بازیابی</h4>
+                    <div class="grid grid-cols-2 gap-3">
+                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-indigo-50 dark:bg-indigo-950/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/30 border border-indigo-200 dark:border-indigo-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📤 پشتیبان گیری
+                        </button>
+                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-900/50 rounded-xl text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
+                            📥 بازیابی
+                        </button>
+                    </div>
+                    <input type="file" id="backup-file-input" onchange="importUsersBackup(event)" accept=".json" class="hidden">
                 </div>
                 <div class="pt-4 flex gap-3">
                     <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 font-medium rounded-lg text-sm transition">انصراف</button>
@@ -2318,9 +2795,530 @@ const HTML_TEMPLATES = {
             </button>
         </div>
     </div>
+	<div id="token-modal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="token-modal-card" class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
+            <div class="flex justify-between items-center mb-6">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-orange-500"></div>
+                    <h3 class="text-lg font-bold text-gray-900 dark:text-white">تنظیم توکن کلودفلر</h3>
+                </div>
+                <button onclick="toggleTokenModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            
+            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-xl text-xs leading-relaxed text-orange-800 dark:text-orange-300 font-medium">
+                توکن کلودفلر شما در این پنل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پنل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
+            </div>
+
+            <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-xl text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+                دریافت توکن کلودفلر
+            </a>
+
+            <div class="space-y-4">
+                <input type="password" id="update-token-input" placeholder="توکن را اینجا وارد کنید" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-xl focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm font-mono text-center text-gray-900 dark:text-zinc-100 transition" dir="auto">
+                
+                <button id="submit-token-btn" onclick="submitTokenForUpdate()" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-sm transition duration-300 shadow-lg shadow-blue-500/25">
+                    ثبت و آپدیت پنل
+                </button>
+            </div>
+        </div>
+    </div>
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
+            <button onclick="toggleQrModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="flex justify-center bg-white p-4 rounded-xl mb-4">
+            <div id="qrcode-container"></div>
+        </div>
+    </div>
+</div>
+    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-2xl shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
+        <div class="flex items-center gap-2">
+            <span class="w-3 h-3 bg-blue-500 rounded-full animate-pulse shadow-sm shadow-blue-500/50"></span>
+            <span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
+        </div>
+        <div class="flex flex-wrap gap-2 justify-end">
+            <button onclick="bulkEdit()" class="px-3 py-1.5 bg-yellow-50 dark:bg-yellow-950/20 text-yellow-600 dark:text-yellow-400 hover:bg-yellow-100 dark:hover:bg-yellow-900/30 rounded-xl text-xs font-bold transition border border-yellow-200 dark:border-yellow-900/50 flex items-center gap-1">
+                ✏️ ویرایش گروهی
+            </button>
+            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-emerald-50 dark:bg-emerald-950/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 rounded-xl text-xs font-bold transition border border-emerald-200 dark:border-emerald-900/50 flex items-center gap-1">
+                ✅ فعال‌سازی
+            </button>
+            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-xl text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
+                ❌ غیرفعال‌سازی
+            </button>
+            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-xl text-xs font-bold transition border border-blue-200 dark:border-blue-900/50 flex items-center gap-1">
+                📊 ریست حجم
+            </button>
+            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-xl text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
+                ⚡ ریست ریکوئست
+            </button>
+            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-xl text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
+                ⏳ ریست زمان
+            </button>
+            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-xl text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
+                🗑️ حذف گروهی
+            </button>
+        </div>
+    </div>
+    <div id="bulk-edit-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+        <div id="bulk-edit-modal-card" class="w-full max-w-xl bg-white dark:bg-zinc-950 border border-gray-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
+            <div class="px-6 py-4 border-b border-gray-150 dark:border-zinc-800/80 flex justify-between items-center bg-gray-50/50 dark:bg-zinc-900/30">
+                <div class="flex items-center gap-2">
+                    <div class="w-2.5 h-2.5 rounded-full bg-yellow-500"></div>
+                    <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-base">ویرایش گروهی کاربران</h3>
+                </div>
+                <button onclick="toggleBulkEditModal(false)" class="p-1 rounded-lg hover:bg-gray-150 dark:hover:bg-zinc-800/60 text-gray-400 hover:text-gray-650 dark:hover:text-zinc-200 transition">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <form id="bulk-edit-form" class="p-6 space-y-5 overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleBulkEditSubmit(event)">
+                <p class="text-xs text-amber-600 dark:text-amber-400 font-semibold mb-2">💡 تغییرات فقط روی بخش‌هایی اعمال می‌شوند که دکمه فعال‌ساز تغییر (چپ) آن‌ها روشن باشد.</p>
+                <div class="space-y-4">
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">حجم (GB)</label>
+                            <input type="number" id="bulk-input-limit" min="0" step="any" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-expiry" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">اعتبار (روز)</label>
+                            <input type="number" id="bulk-input-expiry" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-req-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">سقف ریکوئست</label>
+                            <input type="number" id="bulk-input-req-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ip-limit" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">محدودیت کاربر</label>
+                            <input type="number" id="bulk-input-ip-limit" min="0" placeholder="بدون تغییر" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
+                        </div>
+                    </div>
+					<div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+						<label class="relative inline-flex items-center cursor-pointer select-none">
+							<input type="checkbox" id="bulk-apply-frag" class="sr-only peer">
+							<div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+						</label>
+						<div class="flex-1 grid grid-cols-2 gap-2">
+							<div>
+								<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">Fragment Length</label>
+								<input type="text" id="bulk-input-frag-len" placeholder="20-30" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
+							</div>
+							<div>
+								<label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">Fragment Interval</label>
+								<input type="text" id="bulk-input-frag-int" placeholder="1-2" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr">
+							</div>
+						</div>
+					</div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-fingerprint" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
+                            <select id="bulk-fingerprint-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer">
+                                <option value="chrome">🌐 Chrome</option>
+                                <option value="firefox">🦊 Firefox</option>
+                                <option value="safari">🧭 Safari</option>
+                                <option value="ios">📱 iOS Device</option>
+                                <option value="android">🤖 Android Device</option>
+                                <option value="edge">🌀 Microsoft Edge</option>
+                                <option value="360">🔒 360 Browser</option>
+                                <option value="qq">💬 QQ Browser</option>
+                                <option value="random">🎲 Random (اتفاقی)</option>
+                                <option value="randomized">🎭 Randomized (پویا)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ports" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1 space-y-2">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">پورت‌های اتصال (TLS و غیر TLS)</label>
+                            <div class="grid grid-cols-4 gap-2">
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="443" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 443</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="80" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 80</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="2053" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 2053</label>
+                                <label class="flex items-center gap-1 text-[11px] text-gray-700 dark:text-zinc-300 cursor-pointer"><input type="checkbox" name="bulk-ports" value="2083" class="rounded border-gray-300 dark:border-zinc-800 text-blue-600 focus:ring-blue-500"> 2083</label>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-3 border border-gray-100 dark:border-zinc-900 p-3 rounded-xl bg-gray-50/20 dark:bg-zinc-900/10">
+                        <label class="relative inline-flex items-center cursor-pointer select-none">
+                            <input type="checkbox" id="bulk-apply-ips" class="sr-only peer">
+                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all dark:border-gray-600 peer-checked:bg-blue-600"></div>
+                        </label>
+                        <div class="flex-1">
+                            <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">آیپی تمیز کلودفلر (اختیاری)</label>
+                            <textarea id="bulk-input-ips" rows="2" placeholder="104.16.0.1" class="w-full px-3 py-2 bg-gray-50 dark:bg-zinc-900 border border-gray-200 dark:border-zinc-800 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
+                        </div>
+                    </div>
+                </div>
+                <div class="pt-4 flex gap-3">
+                    <button type="button" onclick="toggleBulkEditModal(false)" class="flex-1 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700/80 text-gray-700 dark:text-zinc-300 font-bold rounded-xl text-sm transition duration-200">انصراف</button>
+                    <button type="submit" id="bulk-submit-btn" class="flex-1 py-3 bg-gradient-to-r from-yellow-600 to-amber-600 hover:from-yellow-700 hover:to-amber-700 text-white font-bold rounded-xl text-sm transition duration-200 shadow-md shadow-yellow-500/10">ثبت تغییرات گروهی</button>
+                </div>
+            </form>
+        </div>
+    </div>
+	<div id="update-success-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+		<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-emerald-500/50 rounded-3xl shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
+			<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-emerald-100 dark:bg-emerald-900/30 text-emerald-500 mb-4 shadow-inner">
+				<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>
+			</div>
+			<h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">آپدیت موفقیت‌آمیز</h3>
+			<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
+				آپدیت موفق بود لطفا صفحه را 10 ثانیه دیگر رفرش کنید تا نسخه جدید لود شود
+			</p>
+			<button onclick="window.location.reload()" class="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white font-black rounded-xl text-sm transition duration-300 shadow-lg shadow-emerald-500/25">
+				رفرش صفحه
+			</button>
+		</div>
+	</div>
+<div id="toast-container" class="fixed top-5 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none"></div>
+
+<div id="custom-confirm-modal" class="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
+    <div id="custom-confirm-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-300">
+        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">تأیید عملیات</h3>
+        <p id="custom-confirm-message" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium"></p>
+        <div class="flex gap-3">
+            <button id="custom-confirm-cancel" class="flex-1 py-3 bg-gray-100 hover:bg-gray-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 text-gray-700 dark:text-zinc-300 font-bold rounded-xl text-sm transition duration-200">انصراف</button>
+            <button id="custom-confirm-ok" class="flex-1 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-sm transition duration-200 shadow-lg">تأیید</button>
+        </div>
+    </div>
+</div>
     <script>
-        window.globalFragLen = "20-30";
-        window.globalFragInt = "1-2";
+		function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const colors = type === 'error' 
+                ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
+                : 'bg-emerald-50 dark:bg-emerald-900/40 border-emerald-200 dark:border-emerald-800 text-emerald-600 dark:text-emerald-400';
+            
+            toast.className = 'px-4 py-3 border rounded-xl shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
+            toast.innerText = message;
+            
+            container.appendChild(toast);
+            
+            requestAnimationFrame(() => {
+                toast.classList.remove('-translate-y-full', 'opacity-0');
+            });
+            
+            setTimeout(() => {
+                toast.classList.add('-translate-y-full', 'opacity-0');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        function customConfirm(message) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('custom-confirm-modal');
+                const card = document.getElementById('custom-confirm-card');
+                const msgEl = document.getElementById('custom-confirm-message');
+                const btnOk = document.getElementById('custom-confirm-ok');
+                const btnCancel = document.getElementById('custom-confirm-cancel');
+
+                msgEl.innerText = message;
+
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('scale-95');
+                card.classList.add('scale-100');
+
+                const cleanup = () => {
+                    modal.classList.remove('opacity-100', 'pointer-events-auto');
+                    modal.classList.add('opacity-0', 'pointer-events-none');
+                    card.classList.remove('scale-100');
+                    card.classList.add('scale-95');
+                    btnOk.removeEventListener('click', onOk);
+                    btnCancel.removeEventListener('click', onCancel);
+                };
+
+                const onOk = () => { cleanup(); resolve(true); };
+                const onCancel = () => { cleanup(); resolve(false); };
+
+                btnOk.addEventListener('click', onOk);
+                btnCancel.addEventListener('click', onCancel);
+            });
+        }
+
+        window.alert = function(message) {
+            const msgStr = message ? message.toString() : '';
+            if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
+                showToast(msgStr, 'error');
+            } else {
+                showToast(msgStr, 'success');
+            }
+        };
+        window.selectedUsernames = new Set();
+        function toggleSelectAllUsers(el) {
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            checkboxes.forEach(cb => {
+                cb.checked = el.checked;
+                const username = decodeURIComponent(cb.value);
+                if (el.checked) {
+                    window.selectedUsernames.add(username);
+                } else {
+                    window.selectedUsernames.delete(username);
+                }
+            });
+            updateBulkActionsBar();
+        }
+        function onUserSelectChange(el) {
+            const username = decodeURIComponent(el.value);
+            if (el.checked) {
+                window.selectedUsernames.add(username);
+            } else {
+                window.selectedUsernames.delete(username);
+            }
+            updateBulkActionsBar();
+        }
+        function updateBulkActionsBar() {
+            const bar = document.getElementById('bulk-actions-bar');
+            const countSpan = document.getElementById('bulk-selected-count');
+            const selectAllCheckbox = document.getElementById('select-all-users');
+            const selectedCount = window.selectedUsernames.size;
+            if (countSpan) {
+                countSpan.innerText = selectedCount + ' کاربر انتخاب شده';
+            }
+            const checkboxes = document.querySelectorAll('input[name="select-user"]');
+            if (checkboxes.length > 0) {
+                const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+                if (selectAllCheckbox) selectAllCheckbox.checked = allChecked;
+            } else {
+                if (selectAllCheckbox) selectAllCheckbox.checked = false;
+            }
+            if (selectedCount > 0) {
+                bar.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-28');
+                bar.classList.add('opacity-100', 'pointer-events-auto', 'translate-y-0');
+            } else {
+                bar.classList.remove('opacity-100', 'pointer-events-auto', 'translate-y-0');
+                bar.classList.add('opacity-0', 'pointer-events-none', 'translate-y-28');
+            }
+        }
+        async function bulkDelete() {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            if (await customConfirm('⚠️ آیا از حذف گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟ این عمل غیرقابل بازگشت است.')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), { method: 'DELETE' });
+                            if (res.ok) {
+                                successCount++;
+                                window.selectedUsernames.delete(uname);
+                            }
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات حذف گروهی انجام شد. ' + successCount + ' کاربر با موفقیت حذف شدند.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        async function bulkToggleStatus(targetActive) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            const actionText = targetActive === 1 ? 'فعال‌سازی' : 'غیرفعال‌سازی';
+            if (await customConfirm('آیا از ' + actionText + ' گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        const user = window.allUsers.find(u => u.username === uname);
+                        if (!user) return;
+                        const isCurrentActive = user.is_active !== 0;
+                        const shouldToggle = (targetActive === 1 && !isCurrentActive) || (targetActive === 0 && isCurrentActive);
+                        if (shouldToggle) {
+                            try {
+                                const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                    method: 'PUT',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ toggle_only: true })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(e) {}
+                        } else {
+                            successCount++;
+                        }
+                    }));
+                    alert('✅ عملیات ' + actionText + ' با موفقیت برای تمامی کاربران واجد شرایط اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        async function bulkReset(actionType) {
+            const usernames = Array.from(window.selectedUsernames);
+            if (usernames.length === 0) return;
+            let actionName = '';
+            if (actionType === 'volume') actionName = 'حجم مصرفی';
+            else if (actionType === 'req') actionName = 'تعداد ریکوئست‌ها';
+            else if (actionType === 'time') actionName = 'زمان اشتراک';
+            if (await customConfirm('آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
+                const bar = document.getElementById('bulk-actions-bar');
+                const buttons = bar.querySelectorAll('button');
+                buttons.forEach(btn => btn.disabled = true);
+                try {
+                    let successCount = 0;
+                    await Promise.all(usernames.map(async (uname) => {
+                        try {
+                            const res = await fetch('/api/users/' + encodeURIComponent(uname), {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ reset_action: actionType })
+                            });
+                            if (res.ok) successCount++;
+                        } catch(e) {}
+                    }));
+                    alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
+                } finally {
+                    buttons.forEach(btn => btn.disabled = false);
+                    updateBulkActionsBar();
+                    await loadUsers(true);
+                }
+            }
+        }
+        function toggleBulkEditModal(show) {
+            const modal = document.getElementById('bulk-edit-modal');
+            const card = document.getElementById('bulk-edit-modal-card');
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+                document.getElementById('bulk-edit-form').reset();
+            }
+        }
+        function bulkEdit() {
+            toggleBulkEditModal(true);
+        }
+        async function handleBulkEditSubmit(event) {
+            event.preventDefault();
+            const submitButton = document.getElementById('bulk-submit-btn');
+            submitButton.disabled = true;
+            submitButton.innerText = 'در حال ثبت تغییرات...';
+            const usernames = Array.from(window.selectedUsernames);
+            const applyLimit = document.getElementById('bulk-apply-limit').checked;
+            const limitValue = document.getElementById('bulk-input-limit').value || null;
+            const applyExpiry = document.getElementById('bulk-apply-expiry').checked;
+            const expiryValue = document.getElementById('bulk-input-expiry').value || null;
+            const applyReqLimit = document.getElementById('bulk-apply-req-limit').checked;
+            const reqLimitValue = document.getElementById('bulk-input-req-limit').value || null;
+            const applyIpLimit = document.getElementById('bulk-apply-ip-limit').checked;
+            const ipLimitValue = document.getElementById('bulk-input-ip-limit').value || null;
+            const applyFingerprint = document.getElementById('bulk-apply-fingerprint').checked;
+            const fingerprintValue = document.getElementById('bulk-fingerprint-select').value;
+            const applyPorts = document.getElementById('bulk-apply-ports').checked;
+            const checkedPorts = Array.from(document.querySelectorAll('input[name="bulk-ports"]:checked')).map(cb => cb.value);
+            const portsValue = checkedPorts.join(',');
+            const tlsValue = checkedPorts.some(p => tlsPorts.includes(p)) ? 'on' : 'off';
+            const applyIps = document.getElementById('bulk-apply-ips').checked;
+            const ipsValue = document.getElementById('bulk-input-ips').value;
+			const applyFrag = document.getElementById('bulk-apply-frag').checked;
+			const fragLenValue = document.getElementById('bulk-input-frag-len').value || '20-30';
+			const fragIntValue = document.getElementById('bulk-input-frag-int').value || '1-2';
+            if (!applyLimit && !applyExpiry && !applyReqLimit && !applyIpLimit && !applyFingerprint && !applyPorts && !applyIps && !applyFrag) {
+                alert('⚠️ لطفا حداقل یک فیلد را برای اعمال تغییر انتخاب کنید!');
+                submitButton.disabled = false;
+                submitButton.innerText = 'ثبت تغییرات گروهی';
+                return;
+            }
+            try {
+                let successCount = 0;
+                await Promise.all(usernames.map(async (uname) => {
+                    const user = window.allUsers.find(u => u.username === uname);
+                    if (!user) return;
+                    const limit = applyLimit ? limitValue : user.limit_gb;
+                    const expiry = applyExpiry ? expiryValue : user.expiry_days;
+                    const reqLimit = applyReqLimit ? reqLimitValue : user.limit_req;
+                    const ipLimit = applyIpLimit ? ipLimitValue : user.ip_limit;
+                    const fingerprint = applyFingerprint ? fingerprintValue : user.fingerprint;
+                    const port = applyPorts ? portsValue : user.port;
+                    const tls = applyPorts ? tlsValue : user.tls;
+                    const ips = applyIps ? ipsValue : user.ips;
+					const frag_len = applyFrag ? fragLenValue : user.frag_len;
+					const frag_int = applyFrag ? fragIntValue : user.frag_int;
+                    try {
+                        const response = await fetch('/api/users/' + encodeURIComponent(uname), {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                username: uname,
+                                limit_gb: limit,
+                                expiry_days: expiry,
+                                limit_req: reqLimit,
+                                tls,
+                                port,
+                                ips,
+                                fingerprint,
+                                ip_limit: ipLimit,
+                                frag_len: frag_len,
+                                frag_int: frag_int
+                            })
+                        });
+                        if (response.ok) {
+                            successCount++;
+                        }
+                    } catch (e) {}
+                }));
+                alert('✅ تغییرات با موفقیت روی ' + successCount + ' کاربر اعمال شد.');
+                toggleBulkEditModal(false);
+                window.selectedUsernames.clear();
+                updateBulkActionsBar();
+                await loadUsers(true);
+            } catch (err) {
+                alert('خطا در انجام تغییرات گروهی');
+            } finally {
+                submitButton.disabled = false;
+                submitButton.innerText = 'ثبت تغییرات گروهی';
+            }
+        }
         const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
         const nonTlsPorts = ['80', '8080', '8880', '2052', '2082', '2086', '2095'];
         let isEditMode = false;
@@ -2390,14 +3388,20 @@ const HTML_TEMPLATES = {
                 document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
                 document.getElementById('input-name').disabled = false;
                 document.getElementById('create-user-form').reset();
-                // بازگردانی پورت‌های 443 و 80 به حالت پیش‌فرض
                 const cb443 = document.querySelector('input[name="ports"][value="443"]');
                 if (cb443) cb443.checked = true;
                 const cb80 = document.querySelector('input[name="ports"][value="80"]');
                 if (cb80) cb80.checked = true;
-                // بازگردانی اثر انگشت به iOS
                 const fpSelect = document.getElementById('fingerprint-select');
                 if (fpSelect) fpSelect.value = 'ios';
+                const bpCheck = document.getElementById('input-block-porn');
+                if (bpCheck) bpCheck.checked = false;
+                const baCheck = document.getElementById('input-block-ads');
+				if (baCheck) baCheck.checked = false;
+				const fragLenInput = document.getElementById('input-frag-len');
+				if (fragLenInput) fragLenInput.value = '20-30';
+				const fragIntInput = document.getElementById('input-frag-int');
+				if (fragIntInput) fragIntInput.value = '1-2';
             }
         }
 		function toggleUpdateModal(show, version = '') {
@@ -2449,6 +3453,47 @@ const HTML_TEMPLATES = {
                 localStorage.setItem('color-theme', 'dark');
             }
         });
+		async function restartCore() {
+			if (!await customConfirm('آیا از ری استارت هسته مطمئن هستید؟ تمام اتصالات یک لحظه قطع خواهند شد.')) return;
+            
+            const btn = document.querySelector('button[title="ری‌استارت هسته ورکر"]');
+            if (btn) {
+                btn.disabled = true;
+                btn.classList.add('animate-pulse');
+            }
+            
+            try {
+                const res = await fetch('/api/restart-core', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
+					toggleTokenModal(true);
+					if (btn) {
+						btn.disabled = false;
+						btn.classList.remove('animate-pulse');
+					}
+					return;
+				}
+                if (res.ok && data.success) {
+                    alert('هسته ورکر با موفقیت ری‌استارت شد! پنل اکنون رفرش می‌شود.');
+                    window.location.reload();
+                } else {
+                    alert('خطا در ری‌استارت هسته: ' + (data.error || 'ناشناخته'));
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.classList.remove('animate-pulse');
+                    }
+                }
+            } catch (err) {
+                alert('خطا در ارتباط با سرور.');
+                if (btn) {
+                    btn.disabled = false;
+                    btn.classList.remove('animate-pulse');
+                }
+            }
+        }
         async function loadUsers(silent = false) {
             const loadingState = document.getElementById('loading-state');
             const tableContainer = document.getElementById('users-table-container');
@@ -2694,9 +3739,10 @@ const HTML_TEMPLATES = {
 					    '</div>';
 					}
 					const onlineCount = user.online_count || 0;
+					const limit = user.ip_limit !== undefined ? user.ip_limit : user.max_connections;
 					let onlineHtml = '';
-					if (user.max_connections) {
-					    const onlinePercent = Math.min((onlineCount / user.max_connections) * 100, 100);
+					if (limit) {
+					    const onlinePercent = Math.min((onlineCount / limit) * 100, 100);
 					    const onlineHue = 120 - (onlinePercent * 1.2);
 					    onlineHtml = '<div class="flex flex-row items-center gap-2 w-full min-w-[90px] select-none">' +
 					        '<div class="w-2 h-20 bg-gray-200 dark:bg-zinc-700 rounded-full flex flex-col justify-end overflow-hidden flex-shrink-0">' +
@@ -2704,7 +3750,7 @@ const HTML_TEMPLATES = {
 					        '</div>' +
 					        '<div class="flex flex-col justify-between h-20 text-[10px] text-gray-500 dark:text-gray-400 font-medium text-right flex-1 whitespace-nowrap">' +
 					            '<span class="text-gray-800 dark:text-zinc-200 leading-none">متصل: ' + onlineCount + '</span>' +
-					            '<span class="leading-none">سقف: ' + user.max_connections + '</span>' +
+					            '<span class="leading-none">سقف: ' + limit + '</span>' +
 					        '</div>' +
 					    '</div>';
 					} else {
@@ -2732,13 +3778,17 @@ const HTML_TEMPLATES = {
                     const statusBtnIcon = user.is_active === 0 
                         ? '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
                         : '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
+                    const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
                     return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
+                            '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-center select-none">' +
+                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95">' +
+                            '</td>' +
                             '<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-center">' +
                                 '<div class="flex flex-col items-center gap-1.5 w-[140px] mx-auto select-none">' +
                                     '<span class="font-bold text-gray-900 dark:text-zinc-100 text-sm truncate max-w-full">' + user.username + '</span>' +
                                     '<div class="flex gap-1 w-full justify-center text-center">' +
                                         (!isEffectivelyActive ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded-md">غیرفعال</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded-md">فعال</span>') +
-                                        (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse" dir="rtl">● آنلاین (' + (user.online_count || 0) + (user.max_connections ? '/' + user.max_connections : '') + ')</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
+                                        (user.is_online === 1 ? '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-emerald-500 text-white rounded-md animate-pulse" dir="rtl">● آنلاین (' + (user.online_count || 0) + (limit ? '/' + limit : '') + ')</span>' : '<span class="px-1.5 py-0.5 text-[10px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded-md">آفلاین</span>') +
                                     '</div>' +
                                     '<div class="grid grid-cols-2 gap-1 w-full">' +
                                         '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کانفیگ" class="p-1.5 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-md transition shadow-sm"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
@@ -2754,6 +3804,12 @@ const HTML_TEMPLATES = {
 							            '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded-lg text-xs font-bold transition border border-indigo-200 dark:border-indigo-800">' +
 							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
 							                'ساب متنی' +
+							            '</button>' +
+							        '</div>' +
+									'<div class="flex gap-1">' +
+							            '<button onclick="showSubQr(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded-lg text-xs font-bold transition border border-amber-200 dark:border-amber-800">' +
+							                '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg>' +
+							                'QR ساب' +
 							            '</button>' +
 							        '</div>' +
 							        '<div class="flex gap-1">' +
@@ -2782,15 +3838,16 @@ const HTML_TEMPLATES = {
 							'<td class="p-2 border-r border-gray-100 dark:border-zinc-800 text-xs text-gray-500 text-center">' + createdDate + '</td>' +
 							'</tr>';
                 }).join('');
+                updateBulkActionsBar();
             }
         }
-async function resetUserData(encodedUsername, actionType) {
-            const username = decodeURIComponent(encodedUsername);
-            let actionName = '';
-            if (actionType === 'volume') actionName = 'حجم';
-            else if (actionType === 'req') actionName = 'ریکوئست';
-            else if (actionType === 'time') actionName = 'زمان';
-            if (confirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
+		async function resetUserData(encodedUsername, actionType) {
+			const username = decodeURIComponent(encodedUsername);
+			let actionName = '';
+			if (actionType === 'volume') actionName = 'حجم';
+			else if (actionType === 'req') actionName = 'ریکوئست';
+			else if (actionType === 'time') actionName = 'زمان';
+			if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
                 try {
                     const response = await fetch('/api/users/' + encodeURIComponent(username), {
                         method: 'PUT',
@@ -2836,9 +3893,13 @@ async function resetUserData(encodedUsername, actionType) {
             const limit = document.getElementById('input-limit').value || null;
             const expiry = document.getElementById('input-expiry').value || null;
             const reqLimit = document.getElementById('input-req-limit').value || null;
-            const maxConnections = document.getElementById('input-max-connections').value || null;
-            const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
-            if (checkedPorts.length === 0) {
+			const ipLimit = document.getElementById('input-ip-limit').value || null;
+			const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value);
+			const block_porn = document.getElementById('input-block-porn').checked;
+			const block_ads = document.getElementById('input-block-ads').checked;
+			const frag_len = document.getElementById('input-frag-len').value;
+			const frag_int = document.getElementById('input-frag-int').value;
+			if (checkedPorts.length === 0) {
                 alert('⚠️ لطفا حداقل یک پورت را برای اتصال انتخاب کنید!');
                 submitButton.disabled = false;
                 submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
@@ -2854,7 +3915,7 @@ async function resetUserData(encodedUsername, actionType) {
                 const response = await fetch(url, {
                     method: method,
                     headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, max_connections: maxConnections })
+					body: JSON.stringify({ username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int })
                 });
                 if (response.ok) {
                     toggleModal(false);
@@ -2897,7 +3958,15 @@ function openUsageWarning() {
     card.classList.remove('opacity-0', 'scale-95');
     card.classList.add('opacity-100', 'scale-100');
 }
-        function getVlessLink(username) {
+function closeFreePanelWarning() {
+    const modal = document.getElementById('free-panel-warning-modal');
+    const card = modal.querySelector('div');
+    modal.classList.remove('opacity-100', 'pointer-events-auto');
+    modal.classList.add('opacity-0', 'pointer-events-none');
+    card.classList.remove('opacity-100', 'scale-100');
+    card.classList.add('opacity-0', 'scale-95');
+}
+function getVlessLink(username) {
             const user = window.allUsers.find(u => u.username === username);
             if (!user) return '';
             const host = window.location.hostname;
@@ -2908,13 +3977,14 @@ function openUsageWarning() {
             }
             const ports = String(user.port || '443').split(',').map(p => p.trim()).filter(p => p.length > 0);
             const fp = user.fingerprint || 'chrome';
+            const userFrag = (user.frag_len && user.frag_int) ? '&fragment=' + user.frag_len + ',' + user.frag_int : '';
             const links = [];
             ips.forEach((ip) => {
                 ports.forEach((portStr) => {
                     const isTlsPort = tlsPorts.includes(portStr);
                     const tlsVal = isTlsPort ? 'tls' : 'none';
                     const remark = user.username + ' | ' + ip + ' | ' + portStr;
-                    links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=%2Fqaim_panel&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(remark));
+                    links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=%qaim_panel&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
                 });
             });
             return links.join('\\n');
@@ -2932,6 +4002,37 @@ function openUsageWarning() {
             }).catch(() => {
                 alert('خطا در کپی کردن لینک ساب!');
             });
+        }
+		function toggleQrModal(show, text) {
+            const modal = document.getElementById('qr-modal');
+            const card = document.getElementById('qr-modal-card');
+            const container = document.getElementById('qrcode-container');
+            if (show) {
+                container.innerHTML = '';
+                new QRCode(container, {
+                    text: text,
+                    width: 200,
+                    height: 200,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+            }
+        }
+
+        function showSubQr(encodedUsername) {
+            const username = decodeURIComponent(encodedUsername);
+            const link = getSubLink(username);
+            toggleQrModal(true, link);
         }
         function copyStatusLink(encodedUsername) {
             const username = decodeURIComponent(encodedUsername);
@@ -2954,6 +4055,10 @@ function openUsageWarning() {
 function editUser(encodedUsername) {
     const username = decodeURIComponent(encodedUsername);
     const user = window.allUsers.find(u => u.username === username);
+	document.getElementById('input-block-porn').checked = user.block_porn === 1;
+	document.getElementById('input-block-ads').checked = (user.block_ads === 1);
+	document.getElementById('input-frag-len').value = user.frag_len || '20-30';
+	document.getElementById('input-frag-int').value = user.frag_int || '1-2';
     if (!user) {
         alert('کاربر یافت نشد!');
         return;
@@ -2968,9 +4073,11 @@ function editUser(encodedUsername) {
     document.getElementById('input-limit').value = user.limit_gb || '';
     document.getElementById('input-expiry').value = user.expiry_days || '';
     document.getElementById('input-req-limit').value = user.limit_req || '';
-    document.getElementById('input-max-connections').value = user.max_connections || '';
+    document.getElementById('input-ip-limit').value = user.ip_limit !== undefined ? (user.ip_limit || '') : (user.max_connections || '');
     document.getElementById('input-ips').value = user.ips || '';
     document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
+	document.getElementById('input-block-porn').checked = (user.block_porn === 1);
+	document.getElementById('input-block-ads').checked = (user.block_ads === 1);
     const userPorts = String(user.port || '').split(',').map(p => p.trim());
     document.querySelectorAll('input[name="ports"]').forEach(cb => {
         cb.checked = userPorts.includes(cb.value);
@@ -2978,8 +4085,8 @@ function editUser(encodedUsername) {
     toggleModal(true);
 }
         async function deleteUser(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            if (confirm('آیا از حذف کاربر ' + username + ' مطمئن هستید؟')) {
+			const username = decodeURIComponent(encodedUsername);
+			if (await customConfirm('آیا از حذف کاربر ' + username + ' مطمئن هستید؟')) {
                 try {
                     const response = await fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
                     if (response.ok) {
@@ -3016,92 +4123,211 @@ function editUser(encodedUsername) {
             });
             select.innerHTML = html;
         }
-        async function loadLocations() {
-            const select = document.getElementById('location-select');
-            const cachedLocations = localStorage.getItem('cached_locations_list');
-            const cachedActiveIata = localStorage.getItem('cached_active_iata') || '';
-            let hasCachedLocs = false;
-            if (cachedLocations) {
-                try {
-                    const parsedLocs = JSON.parse(cachedLocations);
-                    if (Array.isArray(parsedLocs) && parsedLocs.length > 0) {
-                        renderLocationsUI(parsedLocs, cachedActiveIata);
-                        hasCachedLocs = true;
-                    }
-                } catch(e) {}
+async function loadLocations() {
+    const select = document.getElementById('location-select');
+    const cachedLocations = localStorage.getItem('cached_locations_list');
+    const cachedActiveIata = localStorage.getItem('cached_active_iata') || '';
+    let hasCachedLocs = false;
+    if (cachedLocations) {
+        try {
+            const parsedLocs = JSON.parse(cachedLocations);
+            if (Array.isArray(parsedLocs) && parsedLocs.length > 0) {
+                renderLocationsUI(parsedLocs, cachedActiveIata);
+                hasCachedLocs = true;
             }
-            try {
-                const statusRes = await fetch('/api/proxy-ip');
-                let activeIata = '';
-                if (statusRes.ok) {
-                    const statusData = await statusRes.json();
-                    activeIata = statusData.iata || '';
-                    localStorage.setItem('cached_active_iata', activeIata);
-                    if(statusData.frag_len) {
-                        window.globalFragLen = statusData.frag_len;
-                        document.getElementById('frag-length').value = statusData.frag_len;
+        } catch(e) {}
+    }
+    try {
+        const statusRes = await fetch('/api/proxy-ip');
+        let activeIata = '';
+        if (statusRes.ok) {
+            const statusData = await statusRes.json();
+            activeIata = statusData.iata || '';
+            localStorage.setItem('cached_active_iata', activeIata);
+        }
+        const res = await fetch('/locations');
+        if (!res.ok) throw new Error();
+        const locations = await res.json();
+        localStorage.setItem('cached_locations_list', JSON.stringify(locations));
+        renderLocationsUI(locations, activeIata);
+    } catch (err) {
+        if (!hasCachedLocs) {
+            select.innerHTML = '<option value="">⚠️ خطا در دریافت لوکیشن‌ها</option>';
+        }
+    }
+}
+async function saveSettings() {
+    const select = document.getElementById('location-select');
+    const iata = select.value;
+    const btn = document.getElementById('save-settings-btn');
+    btn.disabled = true;
+    btn.innerText = 'در حال ذخیره...';
+    try {
+        let resolvedIp = 'proxyip.cmliussss.net';
+        if (iata) {
+            const domain = iata.toLowerCase() + '.proxyip.cmliussss.net';
+            const dnsRes = await fetch('https://cloudflare-dns.com/dns-query?name=' + domain + '&type=A', {
+                headers: { 'accept': 'application/dns-json' }
+            });
+            resolvedIp = domain;
+            if (dnsRes.ok) {
+                const dnsData = await dnsRes.json();
+                if (dnsData.Answer && dnsData.Answer.length > 0) {
+                    const ips = dnsData.Answer.filter(ans => ans.type === 1).map(ans => ans.data);
+                    if (ips.length > 0) {
+                        resolvedIp = ips[Math.floor(Math.random() * ips.length)];
                     }
-                    if(statusData.frag_int) {
-                        window.globalFragInt = statusData.frag_int;
-                        document.getElementById('frag-interval').value = statusData.frag_int;
-                    }
-                }
-                const res = await fetch('/locations');
-                if (!res.ok) throw new Error();
-                const locations = await res.json();
-                localStorage.setItem('cached_locations_list', JSON.stringify(locations));
-                renderLocationsUI(locations, activeIata);
-            } catch (err) {
-                if (!hasCachedLocs) {
-                    select.innerHTML = '<option value="">⚠️ خطا در دریافت لوکیشن‌ها</option>';
                 }
             }
         }
-        async function saveSettings() {
-            const select = document.getElementById('location-select');
-            const fragLen = document.getElementById('frag-length').value || "20-30";
-            const fragInt = document.getElementById('frag-interval').value || "1-2";
-            const iata = select.value;
-            const btn = document.getElementById('save-settings-btn');
-            btn.disabled = true;
-            btn.innerText = 'در حال ذخیره...';
-            try {
-                let resolvedIp = 'proxyip.cmliussss.net';
-                if (iata) {
-                    const domain = iata.toLowerCase() + '.proxyip.cmliussss.net';
-                    const dnsRes = await fetch('https://cloudflare-dns.com/dns-query?name=' + domain + '&type=A', {
-                        headers: { 'accept': 'application/dns-json' }
-                    });
-                    resolvedIp = domain;
-                    if (dnsRes.ok) {
-                        const dnsData = await dnsRes.json();
-                        if (dnsData.Answer && dnsData.Answer.length > 0) {
-                            const ips = dnsData.Answer.filter(ans => ans.type === 1).map(ans => ans.data);
-                            if (ips.length > 0) {
-                                resolvedIp = ips[Math.floor(Math.random() * ips.length)];
+        const response = await fetch('/api/proxy-ip', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ proxy_ip: resolvedIp, iata: iata ? iata.toUpperCase() : '' })
+        });
+        if (response.ok) {
+            alert('✅ تنظیمات با موفقیت ذخیره شد.\\n' + (iata ? 'آی‌پی پروکسی کلودفلر: ' + resolvedIp : 'آدرس پروکسی به حالت پیش‌فرض بازگشت.'));
+            toggleSettingsModal(false);
+        } else {
+            alert('خطا در ذخیره تنظیمات');
+        }
+    } catch (err) {
+        alert('خطا در برقراری ارتباط با سرور');
+    } finally {
+        btn.disabled = false;
+        btn.innerText = 'ذخیره تنظیمات';
+    }
+}
+        function exportUsersBackup() {
+            if (!window.allUsers || window.allUsers.length === 0) {
+                alert('⚠️ کاربری برای پشتیبان‌گیری وجود ندارد!');
+                return;
+            }
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(window.allUsers, null, 2));
+            const downloadAnchor = document.createElement('a');
+            const dateStr = new Date().toISOString().split('T')[0];
+            downloadAnchor.setAttribute("href", dataStr);
+            downloadAnchor.setAttribute("download", "zeus_users_backup_" + dateStr + ".json");
+            document.body.appendChild(downloadAnchor);
+            downloadAnchor.click();
+            downloadAnchor.remove();
+        }
+        function triggerImportBackup() {
+            document.getElementById('backup-file-input').click();
+        }
+        async function importUsersBackup(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = async function(e) {
+                const importBtn = document.querySelector('button[onclick="triggerImportBackup()"]');
+                const exportBtn = document.querySelector('button[onclick="exportUsersBackup()"]');
+                const closeBtn = document.querySelector('#settings-modal button[onclick="toggleSettingsModal(false)"]');
+                try {
+                    const backupUsers = JSON.parse(e.target.result);
+                    if (!Array.isArray(backupUsers)) {
+                        alert('❌ فایل پشتیبان نامعتبر است! ساختار فایل باید آرایه‌ای از کاربران باشد.');
+                        return;
+                    }
+                    const validBackupUsers = backupUsers.filter(u => u && typeof u === 'object' && u.username);
+                    if (validBackupUsers.length === 0) {
+                        alert('❌ هیچ کاربر معتبری در فایل پشتیبان یافت نشد!');
+                        return;
+                    }
+                    const existingUsernames = new Set((window.allUsers || []).map(u => u.username));
+                    const duplicates = validBackupUsers.filter(u => existingUsernames.has(u.username));
+                    let overwrite = false;
+                    if (duplicates.length > 0) {
+                        overwrite = await customConfirm('⚠️ تعداد ' + duplicates.length + ' کاربر تکراری شناسایی شد. آیا می‌خواهید اطلاعات آن‌ها با فایل پشتیبان بازنویسی شود؟\\n(در صورت انتخاب لغو، کاربران تکراری نادیده گرفته می‌شوند)');
+                    }
+                    if (importBtn) importBtn.disabled = true;
+                    if (exportBtn) exportBtn.disabled = true;
+                    if (closeBtn) closeBtn.disabled = true;
+                    let successCount = 0;
+                    let currentStep = 0;
+                    for (const u of validBackupUsers) {
+                        currentStep++;
+                        if (importBtn) {
+                            importBtn.innerText = '⏳ بازیابی (' + currentStep + '/' + validBackupUsers.length + ')';
+                        }
+                        const exists = existingUsernames.has(u.username);
+                        if (exists) {
+                            if (overwrite) {
+                                try {
+                                    await fetch('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' });
+                                    const res = await fetch('/api/users', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({
+                                            username: u.username,
+                                            uuid: u.uuid,
+                                            limit_gb: u.limit_gb,
+                                            expiry_days: u.expiry_days,
+                                            limit_req: u.limit_req,
+                                            ips: u.ips,
+                                            tls: u.tls,
+                                            port: u.port,
+                                            fingerprint: u.fingerprint,
+                                            ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                            used_gb: u.used_gb,
+                                            used_req: u.used_req,
+                                            created_at: u.created_at,
+                                            is_active: u.is_active,
+                                            block_porn: u.block_porn,
+                                            block_ads: u.block_ads,
+                                            frag_len: u.frag_len,
+                                            frag_int: u.frag_int
+                                        })
+                                    });
+                                    if (res.ok) successCount++;
+                                } catch(err) {}
                             }
+                        } else {
+                            try {
+                                const res = await fetch('/api/users', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({
+                                        username: u.username,
+                                        uuid: u.uuid,
+                                        limit_gb: u.limit_gb,
+                                        expiry_days: u.expiry_days,
+                                        limit_req: u.limit_req,
+                                        ips: u.ips,
+                                        tls: u.tls,
+                                        port: u.port,
+                                        fingerprint: u.fingerprint,
+                                        ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
+                                        used_gb: u.used_gb,
+                                        used_req: u.used_req,
+                                        created_at: u.created_at,
+                                        is_active: u.is_active,
+                                        block_porn: u.block_porn,
+                                        block_ads: u.block_ads,
+                                        frag_len: u.frag_len,
+                                        frag_int: u.frag_int
+                                    })
+                                });
+                                if (res.ok) successCount++;
+                            } catch(err) {}
                         }
                     }
-                }
-                const response = await fetch('/api/proxy-ip', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ proxy_ip: resolvedIp, iata: iata ? iata.toUpperCase() : '', frag_len: fragLen, frag_int: fragInt })
-                });
-                if (response.ok) {
-                    window.globalFragLen = fragLen;
-                    window.globalFragInt = fragInt;
-                    alert('✅ تنظیمات با موفقیت ذخیره شد.\\n' + (iata ? 'آی‌پی پروکسی کلودفلر: ' + resolvedIp : 'آدرس پروکسی به حالت پیش‌فرض بازگشت.'));
+                    alert('✅ عملیات بازیابی با موفقیت انجام شد. ' + successCount + ' کاربر بازیابی شدند.');
                     toggleSettingsModal(false);
-                } else {
-                    alert('خطا در ذخیره تنظیمات');
+                    await loadUsers(true);
+                } catch(err) {
+                    alert('❌ خطا در خواندن یا پردازش فایل پشتیبان!');
+                } finally {
+                    if (importBtn) {
+                        importBtn.disabled = false;
+                        importBtn.innerText = '📥 بارگذاری بک‌آپ';
+                    }
+                    if (exportBtn) exportBtn.disabled = false;
+                    if (closeBtn) closeBtn.disabled = false;
+                    event.target.value = '';
                 }
-            } catch (err) {
-                alert('خطا در برقراری ارتباط با سرور');
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'ذخیره تنظیمات';
-            }
+            };
+            reader.readAsText(file);
         }
         async function changeAdminPassword() {
             const currentPwd = document.getElementById('change-pwd-current').value;
@@ -3140,14 +4366,14 @@ function editUser(encodedUsername) {
             }
         }
         async function logoutAdmin() {
-            if (confirm('⚠️ آیا می‌خواهید از پنل خارج شوید؟')) {
+			if (await customConfirm('آیا می‌خواهید از پنل خارج شوید؟ ⚠️ ')) {
                 try {
                     await fetch('/api/logout', { method: 'POST' });
                 } catch (err) {}
                 window.location.reload();
             }
         }
-const CURRENT_VERSION = '1.4.10';
+const CURRENT_VERSION = '1.5.12';
 const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
 		async function checkForUpdates(isManual = false) {
             try {
@@ -3182,20 +4408,63 @@ const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
                 }
             }
         }
-        async function applyUpdate() {
-            // بستن پنجره آپدیت قبل از شروع عملیات
-            toggleUpdateModal(false);
+        function toggleTokenModal(show) {
+            const modal = document.getElementById('token-modal');
+            const card = document.getElementById('token-modal-card');
+            if (show) {
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+                document.getElementById('update-token-input').value = '';
+            }
+        }
+
+        function submitTokenForUpdate() {
+            const token = document.getElementById('update-token-input').value.trim();
+            if (!token) {
+                alert('لطفاً توکن را وارد کنید.');
+                return;
+            }
+            toggleTokenModal(false);
+            applyUpdate(token);
+        }
+
+        async function applyUpdate(token = null) {
+            if (!token) toggleUpdateModal(false);
             const btn = document.getElementById('update-toggle');
             btn.disabled = true;
-            alert('در حال دریافت و اعمال آپدیت... لطفاً چند ثانیه صبر کنید.');
+            if (!token) alert('در حال دریافت و اعمال آپدیت... لطفاً چند ثانیه صبر کنید.');
             try {
-                const res = await fetch('/api/update-panel', { method: 'POST' });
+                const reqBody = token ? JSON.stringify({ cf_token: token }) : "{}";
+                const res = await fetch('/api/update-panel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: reqBody
+                });
                 const data = await res.json();
+                if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
+                    toggleTokenModal(true);
+                    btn.disabled = false;
+                    return;
+                }
                 if (res.ok && data.success) {
-                    alert('پنل با موفقیت به آخرین نسخه آپدیت شد! در حال راه‌اندازی مجدد پنل (لطفاً ۵ ثانیه صبر کنید)...');
+                    const successModal = document.getElementById('update-success-modal');
+                    const successCard = successModal.querySelector('div');
+                    
+                    successModal.classList.remove('opacity-0', 'pointer-events-none');
+                    successModal.classList.add('opacity-100', 'pointer-events-auto');
+                    successCard.classList.remove('opacity-0', 'scale-95');
+                    successCard.classList.add('opacity-100', 'scale-100');
+                    
                     setTimeout(() => {
                         window.location.reload();
-                    }, 5000);
+                    }, 10000);
                 } else {
                     alert('خطا در بروزرسانی. لطفاً با استفاده از دکمه "آپدیت دستی" اقدام کنید.');
                     btn.disabled = false;
@@ -3296,14 +4565,20 @@ function applySelectedIps() {
     toggleIpSelectorModal(false);
 }
 document.addEventListener('DOMContentLoaded', () => {
-        if (localStorage.getItem('zeus_path_warned_' + CURRENT_VERSION) !== 'true') {
-            const modal = document.getElementById('path-warning-modal');
-            const card = modal.querySelector('div');
-            modal.classList.remove('opacity-0', 'pointer-events-none');
-            modal.classList.add('opacity-100', 'pointer-events-auto');
-            card.classList.remove('opacity-0', 'scale-95');
-            card.classList.add('opacity-100', 'scale-100');
-        }			
+			const freeModal = document.getElementById('free-panel-warning-modal');
+            const freeCard = freeModal.querySelector('div');
+            freeModal.classList.remove('opacity-0', 'pointer-events-none');
+            freeModal.classList.add('opacity-100', 'pointer-events-auto');
+            freeCard.classList.remove('opacity-0', 'scale-95');
+            freeCard.classList.add('opacity-100', 'scale-100');
+            if (localStorage.getItem('zeus_path_warned_' + CURRENT_VERSION) !== 'true') {
+                const modal = document.getElementById('path-warning-modal');
+                const card = modal.querySelector('div');
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            }			
             const versionBadge = document.getElementById('panel-version');
             if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
             renderPortCheckboxes();
@@ -3311,6 +4586,7 @@ document.addEventListener('DOMContentLoaded', () => {
             loadLocations();
             setInterval(() => loadUsers(true), 2000);
             setTimeout(() => checkForUpdates(false), 2000);
+            setInterval(() => checkForUpdates(false), 60000);
         });
     </script>
 </body>
@@ -3347,7 +4623,6 @@ document.addEventListener('DOMContentLoaded', () => {
 </head>
 <body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4">
     <div class="w-full max-w-xl glass rounded-3xl shadow-2xl p-6 md:p-8 relative overflow-hidden">
-        <!-- Background Orbs -->
         <div class="absolute -left-12 -top-12 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
         <div class="absolute -right-12 -bottom-12 w-40 h-40 bg-purple-500/10 rounded-full blur-3xl pointer-events-none"></div>
         <div class="text-center mb-8 relative z-10">
@@ -3365,9 +4640,7 @@ document.addEventListener('DOMContentLoaded', () => {
         <div id="status-card" class="mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 transition duration-300">
             <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
         </div>
-        <!-- Progress Cards -->
         <div class="space-y-5 mb-8 relative z-10">
-            <!-- Traffic usage card -->
             <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
                 <div class="flex justify-between items-center mb-3">
                     <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
@@ -3384,7 +4657,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     <span>حجم کل: <span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200">-</span></span>
                 </div>
             </div>
-            <!-- Expiry card -->
             <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-2xl p-5 shadow-sm">
                 <div class="flex justify-between items-center mb-3">
                     <span class="text-xs font-semibold text-gray-500 dark:text-zinc-400 flex items-center gap-1.5">
@@ -3434,7 +4706,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
             </div>
         </div>
-        <!-- Configurations Card -->
         <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
             <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
                 <svg class="w-4 h-4 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
@@ -3445,6 +4716,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     <span class="flex items-center gap-2">⛓️ کپی لینک ساب‌اسکریپشن متنی</span>
                     <span class="text-indigo-500">کپی</span>
                 </button>
+				<button onclick="showSubQr()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-amber-500 dark:hover:border-amber-500 rounded-xl text-xs font-medium transition shadow-sm">
+                    <span class="flex items-center gap-2">📱 دریافت کیوآر کد ساب</span>
+                    <span class="text-amber-500">نمایش</span>
+                </button>
                 <button onclick="copyVlessConfig()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-blue-500 dark:hover:border-blue-500 rounded-xl text-xs font-medium transition shadow-sm">
                     <span class="flex items-center gap-2">🚀 کپی کانفیگ VLESS (مستقیم)</span>
                     <span class="text-blue-500">کپی</span>
@@ -3452,15 +4727,51 @@ document.addEventListener('DOMContentLoaded', () => {
             </div>
         </div>
     </div>
-<div class="flex items-center gap-4 mt-6 z-10">
-    <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
-        <svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/></svg>
-        سورس کد
-    </a>
-    <a href="https://t.me/IR_NETLIFY" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
-        <svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/></svg>
-        @IR_NETLIFY
-    </a>
+<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
+    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-3xl shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
+        <div class="flex justify-between items-center mb-4">
+            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
+            <button onclick="toggleQrModal(false)" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+            </button>
+        </div>
+        <div class="flex justify-center bg-white p-4 rounded-xl mb-4">
+            <div id="qrcode-container"></div>
+        </div>
+    </div>
+</div>
+<div class="flex flex-col gap-4 mt-6 z-10">
+    <div class="flex items-center gap-4 justify-center">
+        <a href="https://github.com/IR-NETLIFY/zeus" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
+            <svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
+            </svg>
+            گیت‌هاب
+        </a>
+
+        <a href="https://t.me/IR_NETLIFY" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
+            <svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
+            </svg>
+            IR_NETLIFY@
+        </a>
+    </div>
+	
+    <div class="flex items-center gap-4 justify-center">
+        <a href="https://zeus-panel.ir-netlify.workers.dev/" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-amber-600 dark:text-amber-400 hover:text-amber-500 dark:hover:text-amber-300 group">
+            <svg class="w-5 h-5 text-amber-500 dark:text-amber-400 group-hover:scale-110 transition" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+            ساخت رایگان پنل
+        </a>
+
+        <a href="https://donatonion.ir-netlify.workers.dev" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-red-600 dark:text-red-400 hover:text-red-500 dark:hover:text-red-300 group">
+            <svg class="w-5 h-5 text-red-500 dark:text-red-400 group-hover:scale-110 transition" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+            </svg>
+            دونیت
+        </a>
+    </div>
 </div>
     <script>
         /* {{USER_DATA_PLACEHOLDER}} */
@@ -3477,13 +4788,14 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
             var fp = u.fingerprint || 'chrome';
+            const userFrag = (u.frag_len && u.frag_int) ? '&fragment=' + u.frag_len + ',' + u.frag_int : '';
             var links = [];
             ips.forEach(function(ip, ipIndex) {
                 ports.forEach(function(portStr) {
                     var isTlsPort = ['443', '2053', '2083', '2087', '2096', '8443'].includes(portStr);
                     var tlsVal = isTlsPort ? 'tls' : 'none';
                     var remark = ips.length > 1 ? (u.username + '-' + (ipIndex + 1) + '-' + portStr) : (u.username + '-' + portStr);
-                    links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=%2Fqaim_panel&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + '#' + encodeURIComponent(remark));
+                    links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=%qaim_panel&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
                 });
             });
             return links.join('\\n');
@@ -3495,14 +4807,45 @@ document.addEventListener('DOMContentLoaded', () => {
             const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
             navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
         }
+		function toggleQrModal(show, text) {
+            const modal = document.getElementById('qr-modal');
+            const card = document.getElementById('qr-modal-card');
+            const container = document.getElementById('qrcode-container');
+            if (show) {
+                container.innerHTML = '';
+                new QRCode(container, {
+                    text: text,
+                    width: 200,
+                    height: 200,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+                modal.classList.remove('opacity-0', 'pointer-events-none');
+                modal.classList.add('opacity-100', 'pointer-events-auto');
+                card.classList.remove('opacity-0', 'scale-95');
+                card.classList.add('opacity-100', 'scale-100');
+            } else {
+                modal.classList.remove('opacity-100', 'pointer-events-auto');
+                modal.classList.add('opacity-0', 'pointer-events-none');
+                card.classList.remove('opacity-100', 'scale-100');
+                card.classList.add('opacity-0', 'scale-95');
+            }
+        }
+
+        function showSubQr() {
+            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
+            toggleQrModal(true, link);
+        }
         document.addEventListener('DOMContentLoaded', () => {
             const u = window.statusUser;
             if (!u) return;
+            const limit = u.ip_limit !== undefined ? u.ip_limit : u.max_connections;
             document.getElementById('display-username').innerText = u.username;
             const badge = document.getElementById('live-connections-badge');
             badge.classList.remove('hidden');
             if (u.online_count && u.online_count > 0) {
-                document.getElementById('live-connections-text').innerText = u.online_count + (u.max_connections ? '/' + u.max_connections : '') + ' دستگاه متصل';
+                document.getElementById('live-connections-text').innerText = u.online_count + (limit ? '/' + limit : '') + ' دستگاه متصل';
                 badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-500/10 border border-emerald-500/20 text-emerald-500 rounded-full text-xs font-bold shadow-sm';
                 badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-emerald-500 animate-pulse';
             } else {
@@ -3575,11 +4918,10 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.getElementById('req-progress').style.backgroundColor = '#10b981';
             }
             const onlineCount = u.online_count || 0;
-            const maxConns = u.max_connections;
             document.getElementById('online-count').innerText = onlineCount;
-            if (maxConns) {
-                document.getElementById('limit-online').innerText = maxConns;
-                const oPct = Math.min((onlineCount / maxConns) * 100, 100);
+            if (limit) {
+                document.getElementById('limit-online').innerText = limit;
+                const oPct = Math.min((onlineCount / limit) * 100, 100);
                 document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
                 document.getElementById('online-progress').style.width = oPct + '%';
                 const oHue = 120 - (oPct * 1.2);
@@ -3601,7 +4943,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
             } else if (isReqExpired) {
                 statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
-                statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن ریکوئست مجاز';
+                statusText.innerText = '📈 وضعیت اشتراک: تمام شدن ریکوئست مجاز';
             } else if (isTimeExpired) {
                 statusCard.className = 'mb-6 rounded-2xl p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
                 statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
